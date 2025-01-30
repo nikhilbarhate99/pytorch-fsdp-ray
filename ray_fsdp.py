@@ -1,3 +1,15 @@
+
+from ray.util.placement_group import (
+    placement_group,
+    placement_group_table,
+    remove_placement_group,
+)
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+
+# Initialize Ray.
+import ray
+
+
 import os
 import argparse
 import functools
@@ -106,7 +118,7 @@ def test(model, rank, world_size, test_loader):
             100. * ddp_loss[1] / ddp_loss[2]))
         
 
-
+@ray.remote
 def fsdp_main(rank, world_size, args):
     setup(rank, world_size)
 
@@ -172,9 +184,11 @@ def fsdp_main(rank, world_size, args):
     cleanup()
 
 
-if __name__ == '__main__':
-    print("running fsdp!")
+"""
+Refer to vLLM Ray discussion https://github.com/vllm-project/vllm/discussions/691#discussioncomment-10730861
+"""
 
+if __name__ == "__main__":
     # Training settings
     parser = argparse.ArgumentParser(description='PyTorch MNIST Example')
     parser.add_argument('--batch-size', type=int, default=64, metavar='N',
@@ -195,12 +209,53 @@ if __name__ == '__main__':
 
     torch.manual_seed(args.seed)
 
-    WORLD_SIZE = torch.cuda.device_count()
 
-    print("starting fsdp job!")
-    mp.spawn(fsdp_main,
-        args=(WORLD_SIZE, args),
-        nprocs=WORLD_SIZE,
-        join=True)
+    print("=" * 100)
+    print("ray init")
+    ray.init()
+
+    print("=" * 100)
+    print("running fsdp with ray!")
+
+    WORLD_SIZE = torch.cuda.device_count()
+    NUM_CPU_PER_WORKER = 1
+    NUM_GPU_PER_WORKER = 1
+    
+    # mp.spawn(fsdp_main,
+    #     args=(WORLD_SIZE, args),
+    #     nprocs=WORLD_SIZE,
+    #     join=True) 
+
+
+    pg = placement_group(
+        name="ray_fsdp_pg",
+        bundles=[{"CPU": NUM_CPU_PER_WORKER, "GPU": NUM_GPU_PER_WORKER} for _ in range(WORLD_SIZE)],
+        strategy="STRICT_PACK"
+    )
+
+    ray.get(pg.ready(), timeout=10)
+    print(placement_group_table(pg))
+
+    futures = []
+    for i in range(WORLD_SIZE):
+        futures.append(
+            fsdp_main.options(
+                num_cpus=NUM_CPU_PER_WORKER, 
+                num_gpus=NUM_GPU_PER_WORKER,
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    placement_group=pg,
+                    placement_group_bundle_index=i,
+                )
+            ).remote(rank=i, world_size=WORLD_SIZE, args=args)
+        )
+
+    results = [ray.get(f) for f in futures]
+
+
+    print("=" * 100)
+    print("ray shutdown")
+    ray.shutdown()
+    print("=" * 100)
+
 
 

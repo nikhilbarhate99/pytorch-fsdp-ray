@@ -2,7 +2,6 @@ import ray
 import numpy as np
 
 
-
 def ray_task_example():
     # Define a task that sums the values in a matrix.
     @ray.remote

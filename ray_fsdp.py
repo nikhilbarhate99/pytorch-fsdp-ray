@@ -18,6 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torchvision import datasets, transforms
+from torch.utils.data import Subset
 
 
 from torch.optim.lr_scheduler import StepLR
@@ -69,6 +70,20 @@ class ConvNet(nn.Module):
         self.dropout2 = nn.Dropout(0.5)
         self.fc1 = nn.Linear(9216, 128)
         self.fc2 = nn.Linear(128, 10)
+
+        self.fc = nn.Sequential(
+            nn.Linear(9216, 16384),
+            nn.ReLU(),
+            torch.nn.Dropout(0.5),
+            nn.Linear(16384, 16384),
+            nn.ReLU(),
+            torch.nn.Dropout(0.5),
+            nn.Linear(16384, 128),
+            nn.ReLU(),
+            torch.nn.Dropout(0.5),
+            nn.Linear(128, 10)
+        )
+
 
     def forward(self, x):
 
@@ -132,13 +147,18 @@ def test(model, rank, world_size, test_loader, epoch):
 
         test_loss = round((ddp_loss[0] / test_total_count).item(), 6)
 
-        print('Test set: Average loss: {:.4f}, Accuracy: {}/{} ({:.2f}%)\n'.format(
+        print('Test set: Average loss: {:.4f}, Accuracy: {}/{} ({:.2f}%)'.format(
             test_loss, test_correct_count, test_total_count, test_acc))
         
 
         wandb.log({"test/loss": test_loss}, step=epoch)
         wandb.log({"test/acc": test_acc}, step=epoch)
-        
+
+
+def get_gpu_usage(device="cuda:0"):
+    free, total = torch.cuda.mem_get_info(device)
+    mem_used_MB = (total - free) // 1024 ** 2
+    return mem_used_MB
 
 @ray.remote
 def fsdp_main(rank, world_size, args):
@@ -158,24 +178,30 @@ def fsdp_main(rank, world_size, args):
         transforms.Normalize((0.1307,), (0.3081,))
     ])
 
-    dataset1 = datasets.MNIST('../data', train=True, download=True,
+    train_dataset = datasets.MNIST('../data', train=True, download=True,
                         transform=transform)
-    dataset2 = datasets.MNIST('../data', train=False,
+    test_dataset = datasets.MNIST('../data', train=False,
                         transform=transform)
 
-    sampler1 = DistributedSampler(dataset1, rank=rank, num_replicas=world_size, shuffle=True)
-    sampler2 = DistributedSampler(dataset2, rank=rank, num_replicas=world_size)
+
+    og_len = len(train_dataset)
+    train_dataset = Subset(train_dataset, [i for i in range(args.num_train_data)])
+    print(f"trimming training dataset_len from {og_len} to {len(train_dataset)}")
+
+    sampler1 = DistributedSampler(train_dataset, rank=rank, num_replicas=world_size, shuffle=True)
+    sampler2 = DistributedSampler(test_dataset, rank=rank, num_replicas=world_size)
 
     train_kwargs = {'batch_size': args.batch_size, 'sampler': sampler1}
     test_kwargs = {'batch_size': args.test_batch_size, 'sampler': sampler2}
+
     cuda_kwargs = {'num_workers': 2,
                     'pin_memory': True,
                     'shuffle': False}
     train_kwargs.update(cuda_kwargs)
     test_kwargs.update(cuda_kwargs)
 
-    train_loader = torch.utils.data.DataLoader(dataset1,**train_kwargs)
-    test_loader = torch.utils.data.DataLoader(dataset2, **test_kwargs)
+    train_loader = torch.utils.data.DataLoader(train_dataset,**train_kwargs)
+    test_loader = torch.utils.data.DataLoader(test_dataset, **test_kwargs)
     my_auto_wrap_policy = functools.partial(
         size_based_auto_wrap_policy, min_num_params=100
     )
@@ -193,10 +219,36 @@ def fsdp_main(rank, world_size, args):
 
     scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
     init_start_event.record()
-    for epoch in range(1, args.epochs + 1):
+
+    print("-" * 100)
+    print(f"begin of training gpu mem: {get_gpu_usage()}")
+    for epoch in range(0, args.epochs):
+        
+        print("-" * 100)
         train(args, model, rank, world_size, train_loader, optimizer, epoch, sampler=sampler1)
+
+        print(f"after training, gpu mem: {get_gpu_usage()} MB")
+        
+        model.to("cpu")
+
+        dist.barrier()
+        
+        print(f"after moving to cpu, gpu mem: {get_gpu_usage()} MB")
+
+        model.to(rank)
+
+        dist.barrier()
+
+        print(f"after moving back to GPU, gpu mem: {get_gpu_usage()} MB")
+
+
         test(model, rank, world_size, test_loader, epoch)
         scheduler.step()
+
+        print(f"after test, gpu mem: {get_gpu_usage()} MB")
+
+    print("-" * 100)
+
 
     init_end_event.record()
 
@@ -222,11 +274,15 @@ Refer to vLLM Ray discussion https://github.com/vllm-project/vllm/discussions/69
 if __name__ == "__main__":
     # Training settings
     parser = argparse.ArgumentParser(description='PyTorch MNIST Example')
-    parser.add_argument('--batch-size', type=int, default=64, metavar='N',
+    parser.add_argument('--batch-size', type=int, default=128, metavar='N',
                         help='input batch size for training (default: 64)')
-    parser.add_argument('--test-batch-size', type=int, default=1000, metavar='N',
+    parser.add_argument('--test-batch-size', type=int, default=1024, metavar='N',
                         help='input batch size for testing (default: 1000)')
-    parser.add_argument('--epochs', type=int, default=10, metavar='N',
+
+    parser.add_argument('--num-train-data', type=int, default=10000, metavar='N',
+                        help='input batch size for testing (default: 1000)')
+
+    parser.add_argument('--epochs', type=int, default=8, metavar='N',
                         help='number of epochs to train (default: 14)')
     parser.add_argument('--lr', type=float, default=0.001, metavar='LR',
                         help='learning rate (default: 0.001)')

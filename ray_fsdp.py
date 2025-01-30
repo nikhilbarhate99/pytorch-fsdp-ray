@@ -42,8 +42,8 @@ from torch.distributed.fsdp.wrap import (
 import wandb
 
 
-def get_gpu_usage(device="cuda:0"):
-    free, total = torch.cuda.mem_get_info(device)
+def get_gpu_usage(device=0):
+    free, total = torch.cuda.mem_get_info(device=device)
     mem_used_MB = (total - free) // 1024 ** 2
     return mem_used_MB
 
@@ -147,7 +147,7 @@ def train(args, model, rank, world_size, train_loader, optimizer, epoch, sampler
     dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM)
     if rank == 0:
         train_loss = round((ddp_loss[0] / ddp_loss[1]).item(), 6)
-        print('Train Epoch: {} \tLoss: {:.6f}'.format(epoch, train_loss))
+        print('train loss: {:.4f}'.format(train_loss))
 
         wandb.log({"train/loss": train_loss}, step=epoch)
 
@@ -174,7 +174,7 @@ def test(model, rank, world_size, test_loader, epoch):
 
         test_loss = round((ddp_loss[0] / test_total_count).item(), 6)
 
-        print('Test set: Average loss: {:.4f}, Accuracy: {}/{} ({:.2f}%)'.format(
+        print('test loss: {:.4f}, acc: {}/{} ({:.2f}%)'.format(
             test_loss, test_correct_count, test_total_count, test_acc))
         
 
@@ -209,7 +209,10 @@ def move_optimizer_to_device(optimizer, device):
 
 @track_gpu_memory("moving model to device")
 def move_model_to_device(model, device):
-    model.to(device=device)        
+    model.to(device=device)
+    for param in model.parameters():
+        if param.grad is not None:
+            param.grad.to(device=device) 
     dist.barrier()
     torch.cuda.empty_cache()
 
@@ -222,10 +225,10 @@ def clear_torch_cuda_cache():
 
 @ray.remote
 def fsdp_main(rank, world_size, args):
-
-    print("-" * 100)
+    print("-" * 60)
     print(f"begin of fsdp main gpu mem: {get_gpu_usage()} MB")
-    
+    print("-" * 60)
+
     pin_memory = False
 
     setup(rank, world_size)
@@ -260,8 +263,9 @@ def fsdp_main(rank, world_size, args):
     test_kwargs = {'batch_size': args.test_batch_size, 'sampler': sampler2}
 
     cuda_kwargs = {'num_workers': 2,
-                    'pin_memory': pin_memory,
-                    'shuffle': False}
+                'pin_memory': pin_memory,
+                'shuffle': False
+            }
 
     train_kwargs.update(cuda_kwargs)
     test_kwargs.update(cuda_kwargs)
@@ -286,10 +290,13 @@ def fsdp_main(rank, world_size, args):
     scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
     init_start_event.record()
 
-    print("-" * 100)
+    print("-" * 60)
     print(f"begin of training gpu mem: {get_gpu_usage()} MB")
     for epoch in range(0, args.epochs):
-        print("-" * 100)
+        print("-" * 60)
+        print(f"epoch: {epoch}")
+        print("-" * 60)
+
         train(args, model, rank, world_size, train_loader, optimizer, epoch, sampler=sampler1)
         print(f"after train, gpu mem: {get_gpu_usage()} MB")
         print("-" * 30)
@@ -298,9 +305,11 @@ def fsdp_main(rank, world_size, args):
         ### chek for dtype issues (fp16 to fp32) ????
         
         clear_torch_cuda_cache()
+        clear_torch_cuda_cache()
         move_model_to_device(model, "cpu")
         move_optimizer_to_device(optimizer, "cpu")
-        
+        clear_torch_cuda_cache()
+
         print("-" * 30)
         time.sleep(0.5)
         
@@ -313,7 +322,7 @@ def fsdp_main(rank, world_size, args):
         scheduler.step()
         print(f"after test, gpu mem: {get_gpu_usage()} MB")
 
-    print("-" * 100)
+    print("-" * 60)
 
 
     init_end_event.record()
@@ -363,11 +372,11 @@ if __name__ == "__main__":
     torch.manual_seed(args.seed)
 
 
-    print("=" * 100)
+    print("=" * 60)
     print("ray init")
     ray.init()
 
-    print("=" * 100)
+    print("=" * 60)
     print("running fsdp with ray!")
 
     WORLD_SIZE = torch.cuda.device_count()
@@ -405,10 +414,10 @@ if __name__ == "__main__":
     results = [ray.get(f) for f in futures]
 
 
-    print("=" * 100)
+    print("=" * 60)
     print("ray shutdown")
     ray.shutdown()
-    print("=" * 100)
+    print("=" * 60)
 
 
 

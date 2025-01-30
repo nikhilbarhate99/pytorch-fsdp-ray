@@ -11,6 +11,7 @@ import ray
 
 
 import os
+import time
 import argparse
 import functools
 import torch
@@ -19,7 +20,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torchvision import datasets, transforms
 from torch.utils.data import Subset
-
+from typing import Optional, Callable
 
 from torch.optim.lr_scheduler import StepLR
 
@@ -41,12 +42,29 @@ from torch.distributed.fsdp.wrap import (
 import wandb
 
 
-def setup(rank, world_size):
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
+def get_gpu_usage(device="cuda:0"):
+    free, total = torch.cuda.mem_get_info(device)
+    mem_used_MB = (total - free) // 1024 ** 2
+    return mem_used_MB
 
-    # initialize the process group
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+
+
+def track_gpu_memory(description: str = "default") -> Callable:
+    def decorator(func: Callable) -> Callable:
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            # Get description (function name if not provided)
+            desc = description or func.__name__
+            before_mem = get_gpu_usage()
+            # Execute the function
+            result = func(*args, **kwargs)
+            after_mem = get_gpu_usage()
+
+            print(f"[{desc}] before: {before_mem:.2f} MB | after: {after_mem:.2f} MB | change: {after_mem - before_mem:.2f} MB")
+            
+            return result
+        return wrapper
+    return decorator
 
 
 def setup_wandb(rank, name, project, config):
@@ -56,6 +74,15 @@ def setup_wandb(rank, name, project, config):
             project=project,
             config=config,
         )
+
+
+def setup(rank, world_size):
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+
+    # initialize the process group
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+
 
 def cleanup():
     dist.destroy_process_group()
@@ -155,15 +182,53 @@ def test(model, rank, world_size, test_loader, epoch):
         wandb.log({"test/acc": test_acc}, step=epoch)
 
 
-def get_gpu_usage(device="cuda:0"):
-    free, total = torch.cuda.mem_get_info(device)
-    mem_used_MB = (total - free) // 1024 ** 2
-    return mem_used_MB
+
+def _move_to_device_helper(obj, device):
+    if torch.is_tensor(obj):
+        print("moving optim wts")
+        return obj.to(device)
+    elif isinstance(obj, dict):
+        return {key: _move_to_device_helper(value, device) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [_move_to_device_helper(item, device) for item in obj]
+    elif isinstance(obj, tuple):
+        return tuple(_move_to_device_helper(item, device) for item in obj)
+    return obj
+
+
+@track_gpu_memory("moving optimizer to device")
+def move_optimizer_to_device(optimizer, device):
+    # _move_to_device_helper(optimizer.state_dict()["state"], device)
+    for param_id, state in optimizer.state_dict()["state"].items():
+        for k, v in state.items():
+            if torch.is_tensor(v):
+                state[k] = v.to(device=device)
+    dist.barrier()
+    torch.cuda.empty_cache()
+
+
+@track_gpu_memory("moving model to device")
+def move_model_to_device(model, device):
+    model.to(device=device)        
+    dist.barrier()
+    torch.cuda.empty_cache()
+
+
+@track_gpu_memory("clearing torch cuda cache")
+def clear_torch_cuda_cache():
+    dist.barrier()
+    torch.cuda.empty_cache()
+
 
 @ray.remote
 def fsdp_main(rank, world_size, args):
-    setup(rank, world_size)
 
+    print("-" * 100)
+    print(f"begin of fsdp main gpu mem: {get_gpu_usage()} MB")
+    
+    pin_memory = False
+
+    setup(rank, world_size)
 
     setup_wandb(
         rank=rank, 
@@ -195,8 +260,9 @@ def fsdp_main(rank, world_size, args):
     test_kwargs = {'batch_size': args.test_batch_size, 'sampler': sampler2}
 
     cuda_kwargs = {'num_workers': 2,
-                    'pin_memory': True,
+                    'pin_memory': pin_memory,
                     'shuffle': False}
+
     train_kwargs.update(cuda_kwargs)
     test_kwargs.update(cuda_kwargs)
 
@@ -215,36 +281,36 @@ def fsdp_main(rank, world_size, args):
 
     model = FSDP(model)
 
-    optimizer = optim.Adadelta(model.parameters(), lr=args.lr)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr)
 
     scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
     init_start_event.record()
 
     print("-" * 100)
-    print(f"begin of training gpu mem: {get_gpu_usage()}")
+    print(f"begin of training gpu mem: {get_gpu_usage()} MB")
     for epoch in range(0, args.epochs):
-        
         print("-" * 100)
         train(args, model, rank, world_size, train_loader, optimizer, epoch, sampler=sampler1)
-
-        print(f"after training, gpu mem: {get_gpu_usage()} MB")
+        print(f"after train, gpu mem: {get_gpu_usage()} MB")
+        print("-" * 30)
         
-        model.to("cpu")
-
-        dist.barrier()
         
-        print(f"after moving to cpu, gpu mem: {get_gpu_usage()} MB")
+        ### chek for dtype issues (fp16 to fp32) ????
+        
+        clear_torch_cuda_cache()
+        move_model_to_device(model, "cpu")
+        move_optimizer_to_device(optimizer, "cpu")
+        
+        print("-" * 30)
+        time.sleep(0.5)
+        
+        clear_torch_cuda_cache()
+        move_model_to_device(model, rank)
+        move_optimizer_to_device(optimizer, rank)
 
-        model.to(rank)
-
-        dist.barrier()
-
-        print(f"after moving back to GPU, gpu mem: {get_gpu_usage()} MB")
-
-
+        print("-" * 30)
         test(model, rank, world_size, test_loader, epoch)
         scheduler.step()
-
         print(f"after test, gpu mem: {get_gpu_usage()} MB")
 
     print("-" * 100)

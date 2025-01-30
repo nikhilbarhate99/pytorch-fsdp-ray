@@ -1,0 +1,207 @@
+diff --git a/ray_fsdp.py b/ray_fsdp.py
+index e54ff10..a16c5d2 100644
+--- a/ray_fsdp.py
++++ b/ray_fsdp.py
+@@ -37,6 +37,8 @@ from torch.distributed.fsdp.wrap import (
+     wrap,
+ )
+ 
++import wandb
++
+ 
+ def setup(rank, world_size):
+     os.environ['MASTER_ADDR'] = 'localhost'
+@@ -45,6 +47,15 @@ def setup(rank, world_size):
+     # initialize the process group
+     dist.init_process_group("nccl", rank=rank, world_size=world_size)
+ 
++
++def setup_wandb(rank, name, project, config):
++    if rank == 0:
++        run = wandb.init(
++            name=name,
++            project=project,
++            config=config,
++        )
++
+ def cleanup():
+     dist.destroy_process_group()
+ 
+@@ -93,7 +104,10 @@ def train(args, model, rank, world_size, train_loader, optimizer, epoch, sampler
+ 
+     dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM)
+     if rank == 0:
+-        print('Train Epoch: {} \tLoss: {:.6f}'.format(epoch, ddp_loss[0] / ddp_loss[1]))
++        train_loss = round(ddp_loss[0] / ddp_loss[1], 6)
++        print('Train Epoch: {} \tLoss: {:.6f}'.format(epoch, train_loss))
++
++        wandb.log({"train/loss": train_loss}, step=epoch)
+ 
+ 
+ def test(model, rank, world_size, test_loader):
+@@ -112,16 +126,33 @@ def test(model, rank, world_size, test_loader):
+     dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM)
+ 
+     if rank == 0:
+-        test_loss = ddp_loss[0] / ddp_loss[2]
++        test_total_count = int(ddp_loss[2])
++        test_correct_count = int(ddp_loss[1])
++        test_acc = 100. * test_correct_count/ test_total_count
++
++        test_loss = round(ddp_loss[0] / ddp_loss[2], 6)
++
+         print('Test set: Average loss: {:.4f}, Accuracy: {}/{} ({:.2f}%)\n'.format(
+-            test_loss, int(ddp_loss[1]), int(ddp_loss[2]),
+-            100. * ddp_loss[1] / ddp_loss[2]))
++            test_loss, test_correct_count, test_total_count, test_acc))
++        
++
++        wandb.log({"test/loss": test_loss}, step=epoch)
++        wandb.log({"test/acc": test_acc}, step=epoch)
+         
+ 
+ @ray.remote
+ def fsdp_main(rank, world_size, args):
+     setup(rank, world_size)
+ 
++
++    setup_wandb(
++        rank=rank, 
++        name="ray_fsdp_v1",
++        project="pytorch-fsdp-ray",
++        config={}
++    )
++
++
+     transform=transforms.Compose([
+         transforms.ToTensor(),
+         transforms.Normalize((0.1307,), (0.3081,))
+@@ -197,8 +228,8 @@ if __name__ == "__main__":
+                         help='input batch size for testing (default: 1000)')
+     parser.add_argument('--epochs', type=int, default=10, metavar='N',
+                         help='number of epochs to train (default: 14)')
+-    parser.add_argument('--lr', type=float, default=1.0, metavar='LR',
+-                        help='learning rate (default: 1.0)')
++    parser.add_argument('--lr', type=float, default=0.001, metavar='LR',
++                        help='learning rate (default: 0.001)')
+     parser.add_argument('--gamma', type=float, default=0.7, metavar='M',
+                         help='Learning rate step gamma (default: 0.7)')
+     parser.add_argument('--seed', type=int, default=1, metavar='S',
+diff --git a/requirements.txt b/requirements.txt
+index f5cb5f8..12d3d27 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,6 +1,7 @@
+ torch==2.4.1+cu124
+ torchvision==0.19.1+cu124
+ ray[default]==2.41.0
++wandb
+ 
+ ### CPU 
+ # torch==2.4.1+cpu
+diff --git a/run_fsdp.py b/run_fsdp.py
+index 70931ae..d6f8c0d 100644
+--- a/run_fsdp.py
++++ b/run_fsdp.py
+@@ -7,7 +7,6 @@ import torch.nn.functional as F
+ import torch.optim as optim
+ from torchvision import datasets, transforms
+ 
+-
+ from torch.optim.lr_scheduler import StepLR
+ 
+ import torch.distributed as dist
+@@ -25,6 +24,9 @@ from torch.distributed.fsdp.wrap import (
+     wrap,
+ )
+ 
++import wandb
++
++
+ 
+ def setup(rank, world_size):
+     os.environ['MASTER_ADDR'] = 'localhost'
+@@ -33,6 +35,14 @@ def setup(rank, world_size):
+     # initialize the process group
+     dist.init_process_group("nccl", rank=rank, world_size=world_size)
+ 
++def setup_wandb(rank, name, project, config):
++    if rank == 0:
++        run = wandb.init(
++            name=name,
++            project=project,
++            config=config,
++        )
++
+ def cleanup():
+     dist.destroy_process_group()
+ 
+@@ -81,10 +91,13 @@ def train(args, model, rank, world_size, train_loader, optimizer, epoch, sampler
+ 
+     dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM)
+     if rank == 0:
+-        print('Train Epoch: {} \tLoss: {:.6f}'.format(epoch, ddp_loss[0] / ddp_loss[1]))
++        train_loss = round(ddp_loss[0] / ddp_loss[1], 6)
++        print('Train Epoch: {} \tLoss: {:.6f}'.format(epoch, train_loss))
++
++        wandb.log({"train/loss": train_loss}, step=epoch)
+ 
+ 
+-def test(model, rank, world_size, test_loader):
++def test(model, rank, world_size, test_loader, epoch):
+     model.eval()
+     correct = 0
+     ddp_loss = torch.zeros(3).to(rank)
+@@ -100,15 +113,29 @@ def test(model, rank, world_size, test_loader):
+     dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM)
+ 
+     if rank == 0:
+-        test_loss = ddp_loss[0] / ddp_loss[2]
++        test_total_count = int(ddp_loss[2])
++        test_correct_count = int(ddp_loss[1])
++        test_acc = 100. * test_correct_count/ test_total_count
++
++        test_loss = round(ddp_loss[0] / ddp_loss[2], 6)
++
+         print('Test set: Average loss: {:.4f}, Accuracy: {}/{} ({:.2f}%)\n'.format(
+-            test_loss, int(ddp_loss[1]), int(ddp_loss[2]),
+-            100. * ddp_loss[1] / ddp_loss[2]))
++            test_loss, test_correct_count, test_total_count, test_acc))
+         
+ 
++        wandb.log({"test/loss": test_loss}, step=epoch)
++        wandb.log({"test/acc": test_acc}, step=epoch)
++
+ 
+ def fsdp_main(rank, world_size, args):
+     setup(rank, world_size)
++    
++    setup_wandb(
++        rank=rank, 
++        name="run_fsdp_v1",
++        project="pytorch-fsdp-ray",
++        config={}
++    )
+ 
+     transform=transforms.Compose([
+         transforms.ToTensor(),
+@@ -152,7 +179,7 @@ def fsdp_main(rank, world_size, args):
+     init_start_event.record()
+     for epoch in range(1, args.epochs + 1):
+         train(args, model, rank, world_size, train_loader, optimizer, epoch, sampler=sampler1)
+-        test(model, rank, world_size, test_loader)
++        test(model, rank, world_size, test_loader, epoch)
+         scheduler.step()
+ 
+     init_end_event.record()
+@@ -183,8 +210,8 @@ if __name__ == '__main__':
+                         help='input batch size for testing (default: 1000)')
+     parser.add_argument('--epochs', type=int, default=10, metavar='N',
+                         help='number of epochs to train (default: 14)')
+-    parser.add_argument('--lr', type=float, default=1.0, metavar='LR',
+-                        help='learning rate (default: 1.0)')
++    parser.add_argument('--lr', type=float, default=0.001, metavar='LR',
++                        help='learning rate (default: 0.001)')
+     parser.add_argument('--gamma', type=float, default=0.7, metavar='M',
+                         help='Learning rate step gamma (default: 0.7)')
+     parser.add_argument('--seed', type=int, default=1, metavar='S',

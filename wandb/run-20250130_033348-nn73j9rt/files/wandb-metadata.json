@@ -1,0 +1,61 @@
+{
+  "os": "Linux-6.5.0-35-generic-x86_64-with-glibc2.35",
+  "python": "CPython 3.11.10",
+  "startedAt": "2025-01-30T03:33:48.851680Z",
+  "args": [
+    "--node-ip-address=192.168.39.2",
+    "--node-manager-port=41435",
+    "--object-store-name=/tmp/ray/session_2025-01-30_03-33-42_498743_20505/sockets/plasma_store",
+    "--raylet-name=/tmp/ray/session_2025-01-30_03-33-42_498743_20505/sockets/raylet",
+    "--redis-address=None",
+    "--metrics-agent-port=62850",
+    "--runtime-env-agent-port=41552",
+    "--logging-rotate-bytes=536870912",
+    "--logging-rotate-backup-count=5",
+    "--runtime-env-agent-port=41552",
+    "--gcs-address=192.168.39.2:57064",
+    "--session-name=session_2025-01-30_03-33-42_498743_20505",
+    "--temp-dir=/tmp/ray",
+    "--webui=127.0.0.1:8265",
+    "--cluster-id=9e3fec747baa8eecf966cf141c882bfbb5f3e1a95db4012f3173545f",
+    "--startup-token=6",
+    "--worker-launch-time-ms=1738208025059",
+    "--node-id=14106c981dccfce953c87221c4cd522e59d3d0612dc521f0d206a612",
+    "--runtime-env-hash=0"
+  ],
+  "program": "/usr/local/lib/python3.11/dist-packages/ray/_private/workers/default_worker.py",
+  "git": {
+    "remote": "https://github.com/nikhilbarhate99/pytorch-fsdp-ray.git",
+    "commit": "65d460747a92bd59c3828c5fd0a5ddecec38a4f9"
+  },
+  "email": "nikhilbarhate99@gmail.com",
+  "root": "/root/pytorch-fsdp-ray",
+  "host": "c54eba6c213f",
+  "executable": "/usr/bin/python",
+  "cpu_count": 48,
+  "cpu_count_logical": 96,
+  "gpu": "NVIDIA A40",
+  "gpu_count": 1,
+  "disk": {
+    "/": {
+      "total": "21474836480",
+      "used": "780103680"
+    }
+  },
+  "memory": {
+    "total": "540643446784"
+  },
+  "cpu": {
+    "count": 48,
+    "countLogical": 96
+  },
+  "gpu_nvidia": [
+    {
+      "name": "NVIDIA A40",
+      "memoryTotal": "48305799168",
+      "cudaCores": 10752,
+      "architecture": "Ampere"
+    }
+  ],
+  "cudaVersion": "12.4"
+}
